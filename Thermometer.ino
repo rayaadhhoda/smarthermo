@@ -351,6 +351,7 @@ void tftUpdate(float tempF, float tempC) {
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_CYAN);
   tft.print(modeName);
+  tft.fillScreen(ST77XX_BLACK);
   tft.fillRect(0, 96, 135, 60, ST77XX_BLACK);
   String tempFStr = isnan(tempF) ? String("--.- F") : String(String(tempF, 1) + " F");
   drawCenteredText(centerX, 102, tempFStr, 3, ST77XX_YELLOW);
@@ -409,3 +410,13 @@ void loop() {
     bool reached = (!isnan(f) && f >= targetF);
     if (reached && !doneLatched) {
       doneLatched = true;
+      digitalWrite(LED_DONE, HIGH);
+      publishDoneEvent(f);
+    } else if (!isnan(f) && f <= (targetF - DONE_RESET_DELTA)) {
+      doneLatched = false;
+      digitalWrite(LED_DONE, LOW);
+    } else {
+      digitalWrite(LED_DONE, doneLatched ? HIGH : LOW);
+    }
+  }
+}

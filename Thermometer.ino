@@ -1,23 +1,25 @@
 /*
-  Smart Thermometer — Web (F), MQTT, MAX31856, and ST7789 TFT (Portrait)
+  IoT Smart Thermometer — Local + MQTT Cloud Connectivity
   Board : Arduino Uno WiFi Rev2 (NINA)
   Libs  : WiFiNINA, ArduinoMqttClient, Adafruit_MAX31856, Adafruit_GFX, Adafruit_ST7789, SPI
 
-  Web UI: http://<IP>
+  Web UI: http://<device-ip>
   MQTT :
-    Broker  : broker.hivemq.com:1883
-    Topics  : smartthermo/<MAC>/status        (JSON pub every 2s; temp_f/temp_c & target_f/target_c)
-              smartthermo/<MAC>/set_target_f  (sub; payload "165" or {"target_f":165})
-              smartthermo/<MAC>/set_target_c  (sub; payload "74.5" or {"target_c":74.5})
-              smartthermo/<MAC>/cmd           (sub; accepts either target_f or target_c)
+    Broker  : <your-mqtt-broker-address>:1883
+    Topics  : smartthermo/<device-mac>/status
+              smartthermo/<device-mac>/set_target_f
+              smartthermo/<device-mac>/set_target_c
+              smartthermo/<device-mac>/cmd
+              smartthermo/<device-mac>/done  // one-shot when target first reached
 
   MAX31856 (Software SPI):
     D10 -> CS, D11 -> SDI (MOSI), D12 -> SDO (MISO), D13 -> SCK
-  TFT ST7789 (Software SPI, PORTRAIT):
+
+  TFT ST7789 (Software SPI, Portrait):
     SCK=D9, MOSI=D8, CS=D7, DC=D6, RST=D4
 
   Green "Complete" LED:
-    LED anode -> D5, LED cathode -> 220Ω -> GND (LED lights when tempF >= targetF)
+    LED anode -> D5, LED cathode -> 220Ω -> GND (lights when tempF >= targetF)
 */
 
 #include <SPI.h>
@@ -37,22 +39,32 @@ char ssid[] = SECRET_SSID;
 char pass[] = SECRET_PASS;
 WiFiServer server(80);
 
+// Non-blocking Wi-Fi reconnect
+unsigned long lastWifiAttemptMs = 0;
+const unsigned long WIFI_RETRY_MS = 10000;
+bool webServerStarted = false;
+
 // ---------- MQTT ----------
-const char* BROKER = "broker.hivemq.com";
+const char* BROKER = "<your-mqtt-broker-address>";
 const int   PORT   = 1883;
+
 WiFiClient  wifiClient;
 MqttClient  mqttClient(wifiClient);
 unsigned long lastMqttAttemptMs = 0;
 const unsigned long MQTT_RETRY_MS = 10000;
 
 char macHex[13] = {0};
-String topicBase, topicStatus, topicSetTargetF, topicSetTargetC, topicCmd;
+String topicBase, topicStatus, topicSetTargetF, topicSetTargetC, topicCmd, topicDone;
 
 // ---------- App state ----------
-float targetF = 165.0;          // Poultry default
-String modeName = "Poultry";    // Beef / Poultry / Fish / Custom
+float targetF = 165.0;
+String modeName = "Poultry";
 unsigned long lastStatusMs = 0;
 const unsigned long STATUS_EVERY_MS = 2000;
+
+// One-shot DONE event state
+bool   doneLatched = false;
+const  float DONE_RESET_DELTA = 2.0;
 
 // ---------- MAX31856 (Software SPI on 10/11/12/13) ----------
 #define MAX_CS   10
@@ -61,27 +73,20 @@ const unsigned long STATUS_EVERY_MS = 2000;
 #define MAX_CLK  13
 Adafruit_MAX31856 maxthermo(MAX_CS, MAX_DI, MAX_DO, MAX_CLK);
 
-// ---------- TFT ST7789 (Software SPI on your pins, portrait) ----------
+// ---------- TFT ST7789 ----------
 #define TFT_MOSI  8
 #define TFT_SCLK  9
 #define TFT_CS    7
 #define TFT_DC    6
-#define TFT_RST   4   // moved to D4 to free D5 for LED
+#define TFT_RST   4
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
-// ---------- GREEN "COMPLETE" LED ----------
-#define LED_DONE 5   // LED anode -> D5, cathode -> 220Ω -> GND
+// ---------- LED ----------
+#define LED_DONE 5
 
-// ---- display update cadence ----
+// ---- Display cadence ----
 unsigned long lastDispMs = 0;
 const unsigned long DISP_EVERY_MS = 250;
-
-/* ===== Forward declarations (fix compile order) ===== */
-float readTempC();
-void publishStatus(bool toSerial = false);
-void handleHttp();
-void onMqttMessage(int size);
-/* ==================================================== */
 
 // ======= Temperature read (°C) =======
 float readTempC() {
@@ -95,11 +100,7 @@ float readTempC() {
   }
 
   uint8_t f = maxthermo.readFault();
-  if (f) {
-    // Uncomment to debug faults:
-    // Serial.print("MAX fault 0x"); Serial.println(f, HEX);
-    return NAN;
-  }
+  if (f) return NAN;
   return (float)maxthermo.readThermocoupleTemperature();
 }
 
@@ -113,22 +114,29 @@ void printWifiStatus() {
   Serial.print("Open browser: http://"); Serial.println(ip);
 }
 
+// Non-blocking reconnect
 void ensureWifi() {
-  static int status = WL_IDLE_STATUS;
-  if (WiFi.status() == WL_CONNECTED) return;
-
-  Serial.print("Connecting to Network: "); Serial.println(ssid);
-  while (status != WL_CONNECTED) {
-    status = WiFi.begin(ssid, pass);
-    delay(5000);
-    if (status == WL_CONNECTED) break;
-    Serial.print(".");
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!webServerStarted) {
+      server.begin();
+      webServerStarted = true;
+      printWifiStatus();
+    }
+    return;
   }
-  server.begin();
-  printWifiStatus();
+
+  webServerStarted = false;
+  unsigned long now = millis();
+  if (now - lastWifiAttemptMs < WIFI_RETRY_MS) return;
+  lastWifiAttemptMs = now;
+
+  Serial.print("WiFi reconnect attempt -> "); Serial.println(ssid);
+  WiFi.begin(ssid, pass);
 }
 
 // ======= MQTT =======
+void publishStatus(bool toSerial = false);
+
 void ensureMqtt() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (mqttClient.connected()) return;
@@ -148,11 +156,22 @@ void ensureMqtt() {
   mqttClient.subscribe(topicSetTargetC);
   mqttClient.subscribe(topicCmd);
 
-  // Show the exact status topic and publish once right now
-  Serial.print("Status topic: ");
-  Serial.println(topicStatus);
-  publishStatus(true);         // first publish immediately
-  lastStatusMs = millis();     // start the 2s cadence from now
+  Serial.print("Status topic: "); Serial.println(topicStatus);
+  publishStatus(true);
+  lastStatusMs = millis();
+}
+
+void publishDoneEvent(float tempF) {
+  if (!mqttClient.connected()) return;
+  mqttClient.beginMessage(topicDone);
+  mqttClient.print('{');
+  mqttClient.print("\"event\":\"done\"");
+  mqttClient.print(",\"temp_f\":"); mqttClient.print(tempF, 1);
+  mqttClient.print(",\"target_f\":"); mqttClient.print(targetF, 1);
+  mqttClient.print(",\"mode\":\""); mqttClient.print(modeName); mqttClient.print('"');
+  mqttClient.print('}');
+  mqttClient.endMessage();
+  Serial.println("PUB done event");
 }
 
 void publishStatus(bool toSerial) {
@@ -161,24 +180,32 @@ void publishStatus(bool toSerial) {
   float tgtF = targetF;
   float tgtC = FtoC(targetF);
 
-  mqttClient.beginMessage(topicStatus);
-  mqttClient.print('{');
-  mqttClient.print("\"temp_f\":");  if (isnan(tF)) mqttClient.print("null"); else mqttClient.print(tF, 1);
-  mqttClient.print(",\"temp_c\":"); if (isnan(tC)) mqttClient.print("null"); else mqttClient.print(tC, 2);
-  mqttClient.print(",\"target_f\":"); mqttClient.print(tgtF, 1);
-  mqttClient.print(",\"target_c\":"); mqttClient.print(tgtC, 2);
-  mqttClient.print(",\"mode\":\""); mqttClient.print(modeName); mqttClient.print('"');
-  mqttClient.print(",\"ip\":\""); mqttClient.print(WiFi.localIP()); mqttClient.print('"');
-  mqttClient.print(",\"rssi\":"); mqttClient.print(WiFi.RSSI());
-  mqttClient.print('}');
-  mqttClient.endMessage();
+  if (mqttClient.connected()) {
+    mqttClient.beginMessage(topicStatus);
+    mqttClient.print('{');
+    mqttClient.print("\"temp_f\":");  if (isnan(tF)) mqttClient.print("null"); else mqttClient.print(tF, 1);
+    mqttClient.print(",\"temp_c\":"); if (isnan(tC)) mqttClient.print("null"); else mqttClient.print(tC, 2);
+    mqttClient.print(",\"target_f\":"); mqttClient.print(tgtF, 1);
+    mqttClient.print(",\"target_c\":"); mqttClient.print(tgtC, 2);
+    mqttClient.print(",\"mode\":\""); mqttClient.print(modeName); mqttClient.print('"');
+    if (WiFi.status() == WL_CONNECTED) {
+      mqttClient.print(",\"ip\":\""); mqttClient.print(WiFi.localIP()); mqttClient.print('"');
+      mqttClient.print(",\"rssi\":"); mqttClient.print(WiFi.RSSI());
+    }
+    mqttClient.print('}');
+    mqttClient.endMessage();
+  }
 
   if (toSerial) {
     Serial.print("PUB "); Serial.print(topicStatus);
     Serial.print("  tempF="); if (isnan(tF)) Serial.print("null"); else Serial.print(tF, 1);
     Serial.print("  targetF="); Serial.print(tgtF, 1);
     Serial.print("  mode="); Serial.print(modeName);
-    Serial.print("  rssi="); Serial.println(WiFi.RSSI());
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("  rssi="); Serial.println(WiFi.RSSI());
+    } else {
+      Serial.println("  (offline)");
+    }
   }
 }
 
@@ -197,7 +224,7 @@ void onMqttMessage(int size) {
   if (topic == topicSetTargetF || topic == topicCmd) {
     v = payload.toFloat();
     if ((v == 0.0f) && payload != "0") v = extractJsonNumber(payload, "target_f");
-    if (isnan(v) && topic == topicCmd) { // also accept target_c
+    if (isnan(v) && topic == topicCmd) {
       float vc = payload.toFloat();
       if ((vc == 0.0f) && payload != "0") vc = extractJsonNumber(payload, "target_c");
       if (!isnan(vc)) v = CtoF(vc);
@@ -208,19 +235,21 @@ void onMqttMessage(int size) {
     if (!isnan(vc)) v = CtoF(vc);
   }
 
-  if (!isnan(v) && v > -40 && v < 572) { // -40°F..572°F
+  if (!isnan(v) && v > -40 && v < 572) {
     targetF = v;
     modeName = "Custom";
     Serial.print("Target set via MQTT -> "); Serial.print(targetF); Serial.println(" °F");
+    doneLatched = false;
   }
 }
 
-// ---- presets (°F) ----
+// ---- presets ----
 void setPreset(const String& which) {
   if (which == "beef")        { targetF = 145.0; modeName = "Beef";    }
   else if (which == "poultry"){ targetF = 165.0; modeName = "Poultry"; }
   else if (which == "fish")   { targetF = 140.0; modeName = "Fish";    }
   else { modeName = "Custom"; }
+  doneLatched = false;
 }
 
 // ======= HTTP =======
@@ -238,21 +267,18 @@ void handleHttp() {
 
       if (c == '\n') {
         if (currentLine.length() == 0) {
-          // Parse path
           String path = "/";
           int sp = firstLine.indexOf(' ');
           if (sp >= 0) { int sp2 = firstLine.indexOf(' ', sp + 1); if (sp2 > sp) path = firstLine.substring(sp + 1, sp2); }
 
-          // /set?target=NNN (°F)
           if (path.startsWith("/set?")) {
             int ix = path.indexOf("target=");
             if (ix >= 0) {
               float v = path.substring(ix + 7).toFloat();
-              if (!isnan(v) && v > -40 && v < 572) { targetF = v; modeName = "Custom"; }
+              if (!isnan(v) && v > -40 && v < 572) { targetF = v; modeName = "Custom"; doneLatched = false; }
             }
           }
 
-          // /preset?mode=beef|poultry|fish
           if (path.startsWith("/preset?")) {
             int ix = path.indexOf("mode=");
             if (ix >= 0) {
@@ -276,8 +302,7 @@ void handleHttp() {
           client.print("<p><b>Target (°F):</b> "); client.print(targetF, 1);
           client.print("<br><small>(°C: "); client.print(FtoC(targetF), 1); client.println(")</small></p>");
           client.println("<form action='/set' method='get'>Set target °F: <input name='target' type='number' step='0.1'> <button>Apply</button></form>");
-          client.println("<p>Presets: <a href='/preset?mode=beef'>Beef (145°F)</a> | <a href='/preset?mode=poultry'>Poultry (165°F)</a> | <a href='/preset?mode=fish'>Fish (140°F)</a></p>");
-          client.print("<p>MQTT status topic: <code>"); client.print(topicStatus); client.println("</code></p>");
+          client.println("<p>Presets: <a href='/preset?mode=beef'>Beef</a> | <a href='/preset?mode=poultry'>Poultry</a> | <a href='/preset?mode=fish'>Fish</a></p>");
           client.println("</body></html>");
           break;
         } else currentLine = "";
@@ -288,9 +313,7 @@ void handleHttp() {
   client.stop();
 }
 
-// ======= TFT (Portrait) =======
-
-// basic monospace width for Adafruit_GFX: ~6 px per char at textSize=1
+// ======= TFT =======
 int textPixelWidth(const String& s, uint8_t textSize) {
   return s.length() * 6 * textSize;
 }
@@ -305,11 +328,9 @@ void drawCenteredText(int16_t cx, int16_t y, const String& s, uint8_t textSize, 
 }
 
 void tftInit() {
-  tft.init(135, 240);   // panel is 240 (height) x 135 (width)
-  tft.setRotation(2);   // PORTRAIT (flip if needed: 0 or 2)
+  tft.init(135, 240);
+  tft.setRotation(2);
   tft.fillScreen(ST77XX_BLACK);
-
-  // Title (top-left)
   tft.setTextWrap(false);
   tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(2);
@@ -317,8 +338,6 @@ void tftInit() {
   tft.println("Smart");
   tft.setCursor(6, 24);
   tft.println("Thermo");
-
-  // Static labels
   tft.setTextSize(1);
   tft.setCursor(6, 62);    tft.print("Mode:");
   tft.setCursor(6, 196);   tft.print("Target F:");
@@ -327,26 +346,17 @@ void tftInit() {
 void tftUpdate(float tempF, float tempC) {
   const int W = 135;
   const int centerX = W / 2;
-
-  // --- Mode (small) ---
   tft.fillRect(6, 74, 123, 16, ST77XX_BLACK);
   tft.setCursor(6, 76);
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_CYAN);
   tft.print(modeName);
-
-  // --- Big Temp (centered) ---
-  // Clear area where big temp goes (y=96..156)
   tft.fillRect(0, 96, 135, 60, ST77XX_BLACK);
   String tempFStr = isnan(tempF) ? String("--.- F") : String(String(tempF, 1) + " F");
   drawCenteredText(centerX, 102, tempFStr, 3, ST77XX_YELLOW);
-
-  // --- Small °C under it ---
   tft.fillRect(0, 160, 135, 16, ST77XX_BLACK);
   String tempCStr = isnan(tempC) ? String("C: --.-") : String("C: " + String(tempC, 1));
   drawCenteredText(centerX, 160, tempCStr, 1, ST77XX_WHITE);
-
-  // --- Target (small) ---
   tft.fillRect(78, 208, 150, 16, ST77XX_BLACK);
   tft.setCursor(78, 210);
   tft.setTextSize(1);
@@ -358,12 +368,9 @@ void tftUpdate(float tempF, float tempC) {
 void setup() {
   Serial.begin(9600);
   pinMode(LED_BUILTIN, OUTPUT);
-
-  // GREEN LED
   pinMode(LED_DONE, OUTPUT);
   digitalWrite(LED_DONE, LOW);
 
-  // Topics based on MAC
   byte mac[6]; WiFi.macAddress(mac);
   sprintf(macHex, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   topicBase       = String("smartthermo/") + macHex;
@@ -371,20 +378,14 @@ void setup() {
   topicSetTargetF = topicBase + "/set_target_f";
   topicSetTargetC = topicBase + "/set_target_c";
   topicCmd        = topicBase + "/cmd";
+  topicDone       = topicBase + "/done";
 
-  // MAX31856
-  if (maxthermo.begin()) {
-    maxthermo.setThermocoupleType(MAX31856_TCTYPE_K);
-  } else {
-    Serial.println("MAX31856 init failed (check wiring).");
-  }
+  if (maxthermo.begin()) maxthermo.setThermocoupleType(MAX31856_TCTYPE_K);
+  else Serial.println("MAX31856 init failed (check wiring).");
 
-  // Wi-Fi + MQTT
   ensureWifi();
   mqttClient.onMessage(onMqttMessage);
   ensureMqtt();
-
-  // TFT
   tftInit();
 }
 
@@ -393,24 +394,18 @@ void loop() {
   ensureMqtt();
   if (mqttClient.connected()) mqttClient.poll();
 
-  // MQTT status every 2s
   if (mqttClient.connected() && (millis() - lastStatusMs >= STATUS_EVERY_MS)) {
     lastStatusMs = millis();
     publishStatus(true);
   }
 
-  // HTTP handler
   handleHttp();
 
-  // TFT refresh every 250 ms + LED control
   if (millis() - lastDispMs >= DISP_EVERY_MS) {
     lastDispMs = millis();
     float c = readTempC();
     float f = CtoF(c);
     tftUpdate(f, c);
-
-    // ---- LED logic: ON when temp >= target ----
-    if (!isnan(f) && f >= targetF) digitalWrite(LED_DONE, HIGH);
-    else                           digitalWrite(LED_DONE, LOW);
-  }
-}
+    bool reached = (!isnan(f) && f >= targetF);
+    if (reached && !doneLatched) {
+      doneLatched = true;
